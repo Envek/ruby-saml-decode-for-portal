@@ -29,12 +29,15 @@ require "openssl"
 require "xmlcanonicalizer"
 require "digest/sha1"
 require 'rsa_ext.rb'
+require_relative 'signature_algorithm'
+require_relative 'digest_algorithm'
 
 module XMLSecurity
 
   def self.sign_query(request_params, settings)
-    request_params = request_params + "&" + "SigAlg=" + CGI.escape('http://www.w3.org/2000/09/xmldsig#rsa-sha1')
-    request_params << "&" + "Signature=" + CGI.escape(Base64.encode64(settings.private_key.sign(OpenSSL::Digest::SHA1.new, request_params)))
+    algorithm = SignatureAlgorithm.by_certificate(settings.sp_public_cert)
+    request_params = request_params + "&" + "SigAlg=" + CGI.escape(algorithm.url)
+    request_params << "&" + "Signature=" + CGI.escape(Base64.encode64(settings.private_key.sign(algorithm.digester, request_params)))
     request_params
   end
 
@@ -43,13 +46,11 @@ module XMLSecurity
   end
 
   def self.validate_request(saml_request, sing_alg, signature, settings)
-    raise 'Signature must be rsa-sha1 based' unless  sing_alg == "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-
     # building query string
     query = 'SAMLRequest' + '=' + CGI.escape(saml_request)
     query = query +  "&" + "SigAlg=" + CGI.escape(sing_alg)
     signature = Base64.decode64(signature)
-    settings.idp_public_cert.public_key.verify(OpenSSL::Digest::SHA1.new, signature, query)
+    settings.idp_public_cert.public_key.verify(SignatureAlgorithm.new(sing_alg).digester, signature, query)
   end
 
   def self.decode_request(request)
@@ -104,7 +105,8 @@ module XMLSecurity
         hashed_element        = REXML::XPath.first(self, "//[@ID='#{uri[1,uri.size]}']")
         canoner               = XML::Util::XmlCanonicalizer.new(false, true)
         canon_hashed_element  = canoner.canonicalize(hashed_element)
-        hash                  = Base64.encode64(Digest::SHA1.digest(canon_hashed_element)).chomp
+        algorithm             = REXML::XPath.first(ref, "//ds:DigestMethod", {"ds"=>"http://www.w3.org/2000/09/xmldsig#"}).attributes.get_attribute("Algorithm").value
+        hash                  = Base64.encode64(DigestAlgorithm.new(algorithm).digest(canon_hashed_element)).chomp
         digest_value          = REXML::XPath.first(ref, "//ds:DigestValue", {"ds"=>"http://www.w3.org/2000/09/xmldsig#"}).text
 
         valid_flag            = hash == digest_value
@@ -117,18 +119,20 @@ module XMLSecurity
       signed_info_element     = REXML::XPath.first(sig_element, "//ds:SignedInfo", {"ds"=>"http://www.w3.org/2000/09/xmldsig#"})
       canon_string            = canoner.canonicalize(signed_info_element)
 
+      signature_algorithm     = REXML::XPath.first(signed_info_element, "//ds:SignatureMethod", {"ds"=>"http://www.w3.org/2000/09/xmldsig#"}).attributes.get_attribute("Algorithm").value
+      signature_digester      = SignatureAlgorithm.new(signature_algorithm).digester
       base64_signature        = REXML::XPath.first(sig_element, "//ds:SignatureValue", {"ds"=>"http://www.w3.org/2000/09/xmldsig#"}).text
       signature               = Base64.decode64(base64_signature)
 
       # get certificate object
-      valid_flag              = cert.public_key.verify(OpenSSL::Digest::SHA1.new, signature, canon_string)
+      valid_flag              = cert.public_key.verify(signature_digester, signature, canon_string)
 
       return valid_flag
     end
     
     def decode private_key
       # This is the public key which encrypted the first CipherValue
-      certs = REXML::XPath.match(self, '//ds:X509Certificate')#, 'ds' => "http://www.w3.org/2000/09/xmldsig#") array two elements    dcert   = REXML::XPath.first(self, '//ds:X509Certificate')#, 'ds' => "http://www.w3.org/2000/09/xmldsig#")
+      certs = REXML::XPath.match(self, '//ds:X509Certificate', 'ds' => "http://www.w3.org/2000/09/xmldsig#") # array two elements    dcert   = REXML::XPath.first(self, '//ds:X509Certificate')#, 'ds' => "http://www.w3.org/2000/09/xmldsig#")
 
       #Find the certificate for the private key
       cert = certs.select{|c| OpenSSL::X509::Certificate.new(Base64.decode64(c.text)).check_private_key(private_key)}
